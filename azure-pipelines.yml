@@ -1,0 +1,152 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+resources:
+  repositories:
+    - repository: adf_publish
+      type: git
+      name: $(Build.Repository.Name)
+      ref: refs/heads/adf_publish
+
+variables:
+  azureServiceConnection: 'AZURE_SERVICE_CONNECTION_NAME'
+  uatResourceGroup: 'rg-data-uat'
+  prodResourceGroup: 'rg-data-prod'
+  templateFile: 'infra/main.bicep'
+  uatParametersFile: 'infra/parameters/uat.json'
+  prodParametersFile: 'infra/parameters/prod.json'
+  adfTemplateFile: 'adf_publish/ARMTemplateForFactory.json'
+  adfParametersFile: 'adf_publish/ARMTemplateParametersForFactory.json'
+  adfArtifactName: 'adf_publish'
+  uatDataFactoryName: 'adf-uat-001'
+  prodDataFactoryName: 'adf-prod-001'
+
+stages:
+  - stage: Build
+    displayName: 'Validate Infrastructure'
+    jobs:
+      - job: ValidateBicep
+        displayName: 'Validate Bicep'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - checkout: adf_publish
+          - task: AzureCLI@2
+            displayName: 'Bicep build and validate'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az bicep build --file $(templateFile)
+                az deployment group validate \
+                  --resource-group $(uatResourceGroup) \
+                  --template-file $(templateFile) \
+                  --parameters @$(uatParametersFile)
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish ADF ARM templates'
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)/adf_publish'
+              artifact: $(adfArtifactName)
+              publishLocation: 'pipeline'
+
+  - stage: Deploy_UAT
+    displayName: 'Deploy UAT'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployUAT
+        displayName: 'Deploy to UAT'
+        environment: 'uat'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download ADF ARM templates'
+                  inputs:
+                    artifact: $(adfArtifactName)
+                    path: '$(Pipeline.Workspace)/adf_publish'
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep to UAT'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az deployment group create \
+                        --resource-group $(uatResourceGroup) \
+                        --template-file $(templateFile) \
+                        --parameters @$(uatParametersFile)
+                - task: AzureCLI@2
+                  displayName: 'Deploy ADF artifacts to UAT (adf_publish)'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az deployment group create \
+                        --resource-group $(uatResourceGroup) \
+                        --template-file $(Pipeline.Workspace)/adf_publish/ARMTemplateForFactory.json \
+                        --parameters @$(Pipeline.Workspace)/adf_publish/ARMTemplateParametersForFactory.json \
+                        --parameters factoryName=$(uatDataFactoryName)
+
+  - stage: Deploy_Prod
+    displayName: 'Deploy Production'
+    dependsOn: Deploy_UAT
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Deploy to Production'
+        environment: 'prod'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download ADF ARM templates'
+                  inputs:
+                    artifact: $(adfArtifactName)
+                    path: '$(Pipeline.Workspace)/adf_publish'
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep to Production'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az deployment group create \
+                        --resource-group $(prodResourceGroup) \
+                        --template-file $(templateFile) \
+                        --parameters @$(prodParametersFile)
+                - task: AzureCLI@2
+                  displayName: 'Deploy ADF artifacts to Production (adf_publish)'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      az deployment group create \
+                        --resource-group $(prodResourceGroup) \
+                        --template-file $(Pipeline.Workspace)/adf_publish/ARMTemplateForFactory.json \
+                        --parameters @$(Pipeline.Workspace)/adf_publish/ARMTemplateParametersForFactory.json \
+                        --parameters factoryName=$(prodDataFactoryName)
